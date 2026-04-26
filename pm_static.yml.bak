@@ -1,0 +1,22 @@
+# 2026-04-22 - Static partition map for Pro Micro nRF52840 by Claude
+# adafruit_boot reserves first 152KB so PM fills 'app' after it.
+
+adafruit_boot:
+  address: 0x00000000
+  size: 0x00026000
+  region: flash_primary
+
+zboss_nvram:
+  address: 0x000F5000
+  size: 0x00008000
+  region: flash_primary
+
+zboss_product_config:
+  address: 0x000FD000
+  size: 0x00001000
+  region: flash_primary
+
+settings_storage:
+  address: 0x000FE000
+  size: 0x00002000
+  region: flash_primary

@@ -1,11 +1,13 @@
 /* 2026-04-22 - Zigbee LED candle, Sleepy End Device by Claude
  * 2026-04-22 - Button now triggers network steering when not joined (Claude)
+ * 2026-04-26 - Added battery measurement via SAADC on P0.29 (AIN5), Power Config cluster (Claude)
  * GPIO 1.11: candle LED (PWM0 ch0)
  * GPIO 0.31: pairing/identify button (active low)
+ * GPIO 0.29: battery voltage via resistor divider (2M+1M, AIN5)
  * Short press: enter identify/pairing mode
  * Hold 5s: factory reset
  * LED blinks 2Hz until joined to Zigbee network, then switches to flicker.
- * Reports as ZHA dimmable light - auto-discovered by Home Assistant
+ * Reports as ZHA dimmable light with battery level - auto-discovered by Home Assistant
  */
 
 #include <zephyr/types.h>
@@ -13,6 +15,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/adc.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/random/random.h>
@@ -24,11 +27,15 @@
 #include <zigbee/zigbee_error_handler.h>
 #include <zigbee/zigbee_zcl_scenes.h>
 #include <zb_nrf_platform.h>
-#include "zb_dimmable_light.h"
+#include "zb_candle.h"
 
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
 #define CANDLE_ENDPOINT         10
+#define BATTERY_MEASURE_MS      300000  /* measure every 5 minutes */
+#define BATTERY_MV_FULL         4200    /* LiPo full charge */
+#define BATTERY_MV_EMPTY        3000    /* LiPo cutoff */
+
 #define PWM_PERIOD_US           10000U  /* 100 Hz */
 #define FLICKER_INTERVAL_MS     50      /* flicker update rate */
 #define FACTORY_RESET_MS        5000    /* hold button this long to reset */
@@ -72,6 +79,18 @@ typedef struct {
 	zb_zcl_level_control_attrs_t  level_control_attr;
 } bulb_device_ctx_t;
 
+/* Battery attributes - plain variables, updated by ADC measurement */
+static zb_uint8_t bat_voltage_100mv;   /* voltage in 100mV units */
+static zb_uint8_t bat_percentage;      /* 0-200 where 200=100% */
+
+/* ADC for battery voltage on P0.29 (AIN5), resistor divider 2M+1M */
+static const struct adc_dt_spec adc_bat = ADC_DT_SPEC_GET(DT_NODELABEL(battery));
+static int16_t adc_buf;
+static struct adc_sequence adc_seq = {
+	.buffer      = &adc_buf,
+	.buffer_size = sizeof(adc_buf),
+};
+
 static bulb_device_ctx_t dev_ctx;
 
 ZB_ZCL_DECLARE_IDENTIFY_ATTRIB_LIST(identify_attr_list,
@@ -107,14 +126,22 @@ ZB_ZCL_DECLARE_LEVEL_CONTROL_ATTRIB_LIST(level_control_attr_list,
 	&dev_ctx.level_control_attr.current_level,
 	&dev_ctx.level_control_attr.remaining_time);
 
-ZB_DECLARE_DIMMABLE_LIGHT_CLUSTER_LIST(dimmable_light_clusters,
+ZB_ZCL_START_DECLARE_ATTRIB_LIST_CLUSTER_REVISION(power_config_attr_list,
+						  ZB_ZCL_POWER_CONFIG)
+ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID(
+	&bat_voltage_100mv, ),
+ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID(
+	&bat_percentage, ),
+ZB_ZCL_FINISH_DECLARE_ATTRIB_LIST;
+
+ZB_DECLARE_CANDLE_CLUSTER_LIST(candle_clusters,
 	basic_attr_list, identify_attr_list, groups_attr_list,
-	scenes_attr_list, on_off_attr_list, level_control_attr_list);
+	scenes_attr_list, on_off_attr_list, level_control_attr_list,
+	power_config_attr_list);
 
-ZB_DECLARE_DIMMABLE_LIGHT_EP(dimmable_light_ep, CANDLE_ENDPOINT,
-	dimmable_light_clusters);
+ZB_DECLARE_CANDLE_EP(candle_ep, CANDLE_ENDPOINT, candle_clusters);
 
-ZBOSS_DECLARE_DEVICE_CTX_1_EP(dimmable_light_ctx, dimmable_light_ep);
+ZBOSS_DECLARE_DEVICE_CTX_1_EP(dimmable_light_ctx, candle_ep);
 
 /* ---------- PWM / flicker ---------- */
 
@@ -184,6 +211,60 @@ static void pairing_blink_cb(struct k_timer *timer)
 }
 
 static K_TIMER_DEFINE(pairing_blink_timer, pairing_blink_cb, NULL);
+
+/* ---------- Battery measurement ---------- */
+
+static void battery_measure(void)
+{
+	adc_sequence_init_dt(&adc_bat, &adc_seq);
+	if (adc_read(adc_bat.dev, &adc_seq) != 0) {
+		return;
+	}
+
+	int32_t mv = adc_buf;
+
+	adc_raw_to_millivolts_dt(&adc_bat, &mv);
+
+	/* Undo divider: V_bat = V_adc * (2M+1M)/1M = V_adc * 3 */
+	int32_t bat_mv = mv * 3;
+
+	bat_voltage_100mv = (zb_uint8_t)CLAMP(bat_mv / 100, 0, 255);
+
+	int32_t pct = (bat_mv - BATTERY_MV_EMPTY) * 200 /
+		      (BATTERY_MV_FULL - BATTERY_MV_EMPTY);
+
+	bat_percentage = (zb_uint8_t)CLAMP(pct, 0, 200);
+
+	ZB_ZCL_SET_ATTRIBUTE(CANDLE_ENDPOINT,
+		ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+		ZB_ZCL_CLUSTER_SERVER_ROLE,
+		ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
+		&bat_voltage_100mv, ZB_FALSE);
+
+	ZB_ZCL_SET_ATTRIBUTE(CANDLE_ENDPOINT,
+		ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+		ZB_ZCL_CLUSTER_SERVER_ROLE,
+		ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
+		&bat_percentage, ZB_FALSE);
+
+	LOG_INF("battery: %d mV -> %d%%", bat_mv, bat_percentage / 2);
+}
+
+static struct k_work battery_work;
+
+static void battery_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	battery_measure();
+}
+
+static void battery_timer_cb(struct k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	k_work_submit(&battery_work);
+}
+
+static K_TIMER_DEFINE(battery_timer, battery_timer_cb, NULL);
 
 static void on_joined(void)
 {
@@ -448,6 +529,12 @@ int main(void)
 		LOG_ERR("settings init failed: %d", err);
 	}
 
+	/* ADC init */
+	k_work_init(&battery_work, battery_work_handler);
+	if (adc_channel_setup_dt(&adc_bat) != 0) {
+		LOG_ERR("ADC setup failed");
+	}
+
 	/* Zigbee */
 	ZB_ZCL_REGISTER_DEVICE_CB(zcl_device_cb);
 	ZB_AF_REGISTER_DEVICE_CTX(&dimmable_light_ctx);
@@ -466,6 +553,11 @@ int main(void)
 
 	zigbee_configure_sleepy_behavior(true);
 	zigbee_enable();
+
+	/* Initial battery reading + periodic measurement every 5 minutes */
+	battery_measure();
+	k_timer_start(&battery_timer, K_MSEC(BATTERY_MEASURE_MS),
+		      K_MSEC(BATTERY_MEASURE_MS));
 
 	/* Blink at 2Hz until we join a network */
 	k_timer_start(&pairing_blink_timer, K_MSEC(250), K_MSEC(250));

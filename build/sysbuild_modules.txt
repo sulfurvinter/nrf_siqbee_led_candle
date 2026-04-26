@@ -1,2 +1,0 @@
-"nrf":"/home/vinter/ncs/nrf":"/home/vinter/ncs/nrf/sysbuild"
-"mcuboot":"/home/vinter/ncs/bootloader/mcuboot":"/home/vinter/ncs/bootloader/mcuboot/boot/zephyr/sysbuild"
